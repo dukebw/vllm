@@ -2,16 +2,20 @@
 """Benchmark offline inference throughput."""
 
 import argparse
+import base64
 import dataclasses
 import json
+import logging
 import os
 import random
 import time
 import warnings
+from io import BytesIO
 from typing import Any, Optional, Union
 
 import torch
 import uvloop
+from PIL import Image
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
 
@@ -112,6 +116,46 @@ def run_vllm(
     return end - start, outputs
 
 
+def ensure_word_count(chat_prompt: list[dict], word_count: int) -> None:
+    """
+    chat_prompt is the ShareGPT‑style list:
+      [{'role':'user','content':[{'type':'text','text': ...},
+                                 {'type':'image_url', ...}]}]
+    This mutates the *first* text element in‑place so the *entire* prompt
+    has exactly `word_count` words. Returns the final word count (200).
+    """
+    # 1. pull out the first text node
+    content_list = chat_prompt[0]["content"]
+    text_node = next(c for c in content_list if c["type"] == "text")
+    words = text_node["text"].split()
+    if len(words) >= word_count:
+        text_node["text"] = " ".join(words[:word_count])
+        return
+
+    # 2. Repeat until we have reach the word count.
+    # ceildiv
+    reps = -(-(word_count) // len(words))
+    words = (words * reps)[:word_count]
+    text_node["text"] = " ".join(words)
+    return
+
+
+def pil_to_data_uri(img, fmt="JPEG") -> str:
+    """Return a data:image/<fmt>;base64,... URI from a PIL.Image."""
+    buf = BytesIO()
+    img.save(buf, fmt, quality=95)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/{fmt.lower()};base64,{b64}"
+
+
+def b64_to_pil(data_uri: str) -> Image.Image:
+    """Convert a data:image/<fmt>;base64,<payload> URI to a PIL.Image."""
+    assert data_uri.startswith("data:image"), f"unexpected URI: {data_uri[:50]}"
+    # Drop the 'data:image/...;base64,' prefix.
+    b64_payload = data_uri.split(",", 1)[1]
+    return Image.open(BytesIO(base64.b64decode(b64_payload)))
+
+
 def run_vllm_chat(
     requests: list[SampleRequest],
     n: int,
@@ -123,7 +167,55 @@ def run_vllm_chat(
     multimodal models as it properly handles multimodal inputs and chat
     formatting. For non-multimodal models, use run_vllm() instead.
     """
+
     from vllm import LLM, SamplingParams
+
+    prompts = []
+    sampling_params: list[SamplingParams] = []
+    img_sizes = []
+
+    for request in requests:
+        # ----------- extract the single image -----------------
+        mm = request.multi_modal_data
+        assert mm["type"] == "image_url", f"unexpected type: {mm['type']}"
+        img = b64_to_pil(mm["image_url"]["url"])
+        if args.resize_images:
+            old_sz = img.size
+            img = img.resize((args.resize_images, args.resize_images), Image.BILINEAR)
+            logging.debug(
+                "img %s  %s→%s", mm["image_url"]["url"][:40], old_sz, img.size
+            )
+        img_sizes.append(img.size)
+
+        new_uri = pil_to_data_uri(img)
+        mm["image_url"]["url"] = new_uri
+        # prompt[0]["content"][?] holds the very same dict object,
+        # so replace it as well if present.
+        for node in request.prompt[0]["content"]:
+            if node.get("type") == "image_url":
+                node["image_url"]["url"] = new_uri
+                break
+
+        if args.word_count is not None:
+            ensure_word_count(request.prompt, args.word_count)
+        prompt_text = next(
+            c for c in request.prompt[0]["content"] if c["type"] == "text"
+        )["text"]
+        logging.info(f"prompt={prompt_text}")
+        logging.info("prompt word count = %d", len(prompt_text.split()))
+
+        prompts.append(request.prompt)
+        sampling_params.append(
+            SamplingParams(
+                n=n,
+                temperature=1.0,
+                top_p=1.0,
+                ignore_eos=True,
+                max_tokens=request.expected_output_len,
+                detokenize=not disable_detokenize,
+            )
+        )
+    logging.info(f"img_sizes: {img_sizes}")
 
     llm = LLM(**dataclasses.asdict(engine_args))
 
@@ -136,20 +228,6 @@ def run_vllm_chat(
         "prompt_len and expected_output_len for all requests."
     )
 
-    prompts = []
-    sampling_params: list[SamplingParams] = []
-    for request in requests:
-        prompts.append(request.prompt)
-        sampling_params.append(
-            SamplingParams(
-                n=n,
-                temperature=1.0,
-                top_p=1.0,
-                ignore_eos=True,
-                max_tokens=request.expected_output_len,
-                detokenize=not disable_detokenize,
-            )
-        )
     start = time.perf_counter()
     outputs = llm.chat(prompts, sampling_params, use_tqdm=True)
     end = time.perf_counter()
@@ -595,7 +673,28 @@ def validate_args(args):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)5s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     parser = FlexibleArgumentParser(description="Benchmark the throughput.")
+    parser.add_argument(
+        "--word-count",
+        type=int,
+        default=None,
+        metavar="WORDCOUNT",
+        help="Fix the input prompt size",
+    )
+    parser.add_argument(
+        "--resize-images",
+        type=int,
+        default=None,
+        metavar="SIZE",
+        help="Resize every image to SIZE×SIZE pixels before inference "
+        "(e.g. --resize-images 512).",
+    )
     parser.add_argument(
         "--backend",
         type=str,
