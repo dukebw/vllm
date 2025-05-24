@@ -6,7 +6,6 @@ import enum
 import hashlib
 import inspect
 import json
-import re
 import textwrap
 import uuid
 import warnings
@@ -20,6 +19,7 @@ from pathlib import Path
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Literal, Optional,
                     Protocol, TypeVar, Union, cast, get_args, get_origin)
 
+import regex as re
 import torch
 from torch.distributed import ProcessGroup, ReduceOp
 from transformers import PretrainedConfig
@@ -988,7 +988,7 @@ class ModelConfig:
             self.use_async_output_proc = False
             return
 
-        # Reminder: Please update docs/source/features/compatibility_matrix.md
+        # Reminder: Please update docs/features/compatibility_matrix.md
         # If the feature combo become valid
         from vllm.platforms import current_platform
         if not current_platform.is_async_output_supported(self.enforce_eager):
@@ -1004,7 +1004,7 @@ class ModelConfig:
         if self.runner_type == "pooling":
             self.use_async_output_proc = False
 
-        # Reminder: Please update docs/source/features/compatibility_matrix.md
+        # Reminder: Please update docs/features/compatibility_matrix.md
         # If the feature combo become valid
         if speculative_config:
             self.use_async_output_proc = False
